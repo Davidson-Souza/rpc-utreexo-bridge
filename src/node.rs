@@ -30,8 +30,8 @@
 ///             to err on `WouldBlock`. If we don't succeed in sending all the buffer, the [Worker]
 ///             will schedule us for write events (we won't read before finishing the write).
 use std::cell::UnsafeCell;
-use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt::Display;
 use std::io::Read;
 use std::io::Write;
@@ -59,7 +59,6 @@ use bitcoin::p2p::Magic;
 use bitcoin::p2p::ServiceFlags;
 use bitcoin::BlockHash;
 use log::debug;
-use log::error;
 use log::info;
 use mio::net::TcpListener;
 use mio::net::TcpStream;
@@ -201,16 +200,15 @@ impl Node {
         block_notifier: Receiver<BlockHash>,
     ) {
         let listener = TcpListener::bind(address).expect("Failed to bind to address");
-        let (register, register_rx) = std::sync::mpsc::channel();
+        let (worker_sender, worker_messages) = std::sync::mpsc::channel();
         let reactor = Reactor {
             block_notifier,
             listener,
-            registered: HashMap::new(),
-            register: register_rx,
-            worker_pool: Self::create_workers(&worker_context, register),
-            magic: worker_context.magic,
-            pings: BTreeMap::new(),
-            timeouts: BTreeMap::new(),
+            worker_messages,
+            worker_pool: Self::create_workers(&worker_context, worker_sender),
+            pings: HashMap::new(),
+            timeouts: HashMap::new(),
+            ids: HashSet::new(),
         };
 
         std::thread::Builder::new()
@@ -222,7 +220,7 @@ impl Node {
     /// spawns our workers
     fn create_workers(
         worker_context: &WorkerContext,
-        scheduler: Sender<(usize, TcpStream, Intent)>,
+        scheduler: Sender<WorkerMessage>,
     ) -> [Sender<Message>; WORKES_PER_CLUSTER] {
         let mut workers = Vec::new();
         let peers = Rc::new(UnsafeCell::new(HashMap::new()));
@@ -258,20 +256,21 @@ pub enum Message {
     ///
     /// Once a worker gets this, it'll construct a [Peer] struct and schedule it for the next
     /// message
-    NewConnection(TcpStream),
+    NewConnection((usize, TcpStream)),
     /// There's something to read in the socket
-    ReadReady((TcpStream, usize)),
+    ReadReady(usize),
     /// We can write to the socket
-    WriteReady((TcpStream, usize)),
+    WriteReady(usize),
     /// Some peer disconnected (either them or us killed the socket)
     Disconnect(usize),
+    /// Send something to the peer, usually ping and block broadcast
+    SendToPeer((usize, NetworkMessage)),
 }
 
-#[derive(Debug)]
-/// What are we waiting for
-enum Intent {
-    Read,
-    Write,
+pub enum WorkerMessage {
+    /// We got an error while trying to read/write
+    /// assume it's dead
+    Disconnect((TcpStream, usize)),
 }
 
 /// A struct that will run and wait for work to do. Once it gets a new work from [Reactor], it will
@@ -288,9 +287,9 @@ struct Worker {
     /// bellow). We don't need to worry about synchronization here. Moreover, we'll never drop
     /// this, as our workers lives through the entire lifetime of our program, we don't need an
     /// [Arc].
-    peers: Rc<UnsafeCell<HashMap<usize, Peer>>>,
-    /// A channel to ask the [Reactor] to notify us about new events
-    scheduler: Sender<(usize, TcpStream, Intent)>,
+    peers: Rc<UnsafeCell<HashMap<usize, (Peer, TcpStream)>>>,
+    /// The channel to notify the [Reactor] about new events
+    scheduler: Sender<WorkerMessage>,
 
     /// We use those to build [Peer]
     proof_backend: Arc<RwLock<BlockFile>>,
@@ -309,13 +308,13 @@ impl Worker {
     /// inside a thread
     fn new(
         id: usize,
-        peers: Rc<UnsafeCell<HashMap<usize, Peer>>>,
+        peers: Rc<UnsafeCell<HashMap<usize, (Peer, TcpStream)>>>,
         proof_backend: Arc<RwLock<BlockFile>>,
         proof_index: Arc<BlocksIndex>,
         chainview: Arc<ChainView>,
         magic: Magic,
         job_receiver: Receiver<Message>,
-        scheduler: Sender<(usize, TcpStream, Intent)>,
+        scheduler: Sender<WorkerMessage>,
     ) -> Self {
         Self {
             peers,
@@ -329,6 +328,77 @@ impl Worker {
         }
     }
 
+    fn handle_disconnect(&self, id: usize) {
+        debug!("worker: peer {id} disconnected");
+        let peers = unsafe { &mut *self.peers.get() };
+        let Some((_, stream)) = peers.remove(&id) else {
+            return;
+        };
+
+        self.scheduler
+            .send(WorkerMessage::Disconnect((stream, id)))
+            .expect("reactor died");
+    }
+
+    fn handle_write(&self, id: usize) {
+        let peers = unsafe { &mut *self.peers.get() };
+        let Some((peer, stream)) = peers.get_mut(&id) else {
+            self.handle_disconnect(id);
+            return;
+        };
+
+        match peer.write_back(stream) {
+            Ok(false) => self.handle_write(id), // write until we get a EWOULDBLOCK
+            Err(err) => {
+                if let PeerError::Io(ref e) = err {
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        return;
+                    }
+                }
+
+                log::error!("Error writing to peer: {}", err);
+                self.handle_disconnect(id);
+                return;
+            }
+            Ok(true) => { /* we are done */ }
+        }
+    }
+
+    fn send_to_peer(&self, id: usize, message: NetworkMessage) {
+        let peers = unsafe { &mut *self.peers.get() };
+        let Some((peer, _)) = peers.get_mut(&id) else {
+            self.handle_disconnect(id);
+            return;
+        };
+
+        if let Err(err) = peer.send_message(message) {
+            log::error!("Error sending message to peer: {}", err);
+            self.handle_disconnect(id);
+        }
+    }
+
+    fn handle_read(&self, id: usize) {
+        let peers = unsafe { &mut *self.peers.get() };
+        let Some((peer, stream)) = peers.get_mut(&id) else {
+            self.handle_disconnect(id);
+            return;
+        };
+
+        if let Err(err) = peer.handle_request(stream) {
+            if let PeerError::Io(ref e) = err {
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    return;
+                }
+            }
+
+            log::error!("Error handling request: {}", err);
+            self.handle_disconnect(id);
+            return;
+        }
+
+        self.handle_write(id);
+    }
+
     /// Takes ownership of the worker and runs until this thread dies
     fn run(self) {
         debug!("Worker {} started", self.id);
@@ -339,7 +409,7 @@ impl Worker {
                 .expect("job_receiver channel is broken");
 
             match job {
-                Message::NewConnection(socket) => {
+                Message::NewConnection(new_peer) => {
                     let peer = Peer::new(
                         "unknown".to_string(),
                         "unknown".to_string(),
@@ -349,112 +419,33 @@ impl Worker {
                         self.magic,
                     );
 
-                    let id: usize = random();
+                    let (id, socket) = new_peer;
                     let peers = unsafe { &mut *self.peers.get() };
+                    peers.insert(id, (peer, socket));
 
-                    peers.insert(id, peer);
-                    self.scheduler
-                        .send((id, socket, Intent::Read))
-                        .expect("reactor died");
+                    self.handle_read(id);
                 }
 
-                Message::ReadReady((mut stream, id)) => {
-                    debug!("worker: got read event for peer {id}");
-
-                    let peers = unsafe { &mut *self.peers.get() };
-                    let Some(peer) = peers.get_mut(&id) else {
-                        log::error!("can't find peer: {id}");
-                        peers.remove(&id);
-                        continue;
-                    };
-
-                    if let Err(err) = peer.handle_request(&mut stream) {
-                        log::error!("Error handling request: {}", err);
-                        if let PeerError::Io(ref e) = err {
-                            if e.kind() == std::io::ErrorKind::WouldBlock {
-                                self.scheduler
-                                    .send((id, stream, Intent::Read))
-                                    .expect("reactor died");
-
-                                continue;
-                            }
-                        }
-
-                        peers.remove(&id);
-                        continue;
-                    }
-
-                    match peer.write_back(&mut stream) {
-                        Ok(true) => self
-                            .scheduler
-                            .send((id, stream, Intent::Read))
-                            .expect("reactor died"),
-
-                        Ok(false) => self
-                            .scheduler
-                            .send((id, stream, Intent::Write))
-                            .expect("reactor died"),
-
-                        Err(err) => {
-                            log::error!("Error handling request: {}", err);
-                            if let PeerError::Io(ref e) = err {
-                                if e.kind() == std::io::ErrorKind::WouldBlock {
-                                    self.scheduler
-                                        .send((id, stream, Intent::Write))
-                                        .expect("reactor died");
-                                    continue;
-                                }
-                            }
-
-                            peers.remove(&id);
-                            continue;
-                        }
-                    }
+                Message::ReadReady(id) => {
+                    debug!("worker: got readevent for peer {id}");
+                    self.handle_read(id);
+                    self.handle_write(id);
                 }
 
-                Message::WriteReady((mut stream, id)) => {
-                    debug!("worker: got event for peer {id}");
-
-                    let peers = unsafe { &mut *self.peers.get() };
-                    let Some(peer) = peers.get_mut(&id) else {
-                        log::error!("can't find peer: {id}");
-                        peers.remove(&id);
-                        continue;
-                    };
-
-                    match peer.write_back(&mut stream) {
-                        Ok(true) => self
-                            .scheduler
-                            .send((id, stream, Intent::Read))
-                            .expect("reactor died"),
-
-                        Ok(false) => self
-                            .scheduler
-                            .send((id, stream, Intent::Write))
-                            .expect("reactor died"),
-
-                        Err(err) => {
-                            log::error!("Error handling request: {}", err);
-                            if let PeerError::Io(ref e) = err {
-                                if e.kind() == std::io::ErrorKind::WouldBlock {
-                                    self.scheduler
-                                        .send((id, stream, Intent::Write))
-                                        .expect("reactor died");
-                                    continue;
-                                }
-                            }
-
-                            peers.remove(&id);
-                            continue;
-                        }
-                    }
+                Message::WriteReady(id) => {
+                    debug!("worker: got write event for peer {id}");
+                    self.handle_write(id);
                 }
 
                 Message::Disconnect(id) => {
-                    info!("worker: peer {id} disconnected");
+                    debug!("worker: peer {id} disconnected");
 
                     let peers = unsafe { &mut *self.peers.get() };
                     peers.remove(&id);
+                }
+
+                Message::SendToPeer((id, message)) => {
+                    self.send_to_peer(id, message);
                 }
             }
         }
@@ -469,18 +460,15 @@ struct Reactor {
     listener: TcpListener,
     /// Channels to our workers
     worker_pool: [Sender<Message>; WORKES_PER_CLUSTER],
-    /// A channel we use to receive things to watch
-    register: Receiver<(usize, TcpStream, Intent)>,
-    /// Sockets we are watching
-    registered: HashMap<usize, (TcpStream, Intent)>,
     /// This channel will notify us about new blocks
     block_notifier: Receiver<BlockHash>,
-    /// Magic value for this network
-    magic: Magic,
+    /// Our workers will use this channel to notify us about disconnections
+    worker_messages: Receiver<WorkerMessage>,
     /// If a peer doesn't send us a message for too long, poke it to see if it's still alive
-    timeouts: BTreeMap<Instant, usize>,
+    timeouts: HashMap<usize, Instant>,
+    ids: HashSet<usize>,
     /// pings we've sent
-    pings: BTreeMap<Instant, usize>,
+    pings: HashMap<usize, Instant>,
 }
 
 impl Reactor {
@@ -492,169 +480,166 @@ impl Reactor {
 
         let mut events = mio::Events::with_capacity(1024);
         loop {
-            let registry = poll.registry();
-            while let Ok(mut work) = self.register.try_recv() {
-                debug!("reactor: registering {} for {:?}", work.0, work.2);
+            // Check if some worker has something to say
+            for message in self.worker_messages.try_iter() {
+                match message {
+                    WorkerMessage::Disconnect((mut stream, id)) => {
+                        poll.registry()
+                            .deregister(&mut stream)
+                            .expect("Failed to deregister");
 
-                self.timeouts
-                    .insert(Instant::now() + Duration::from_secs(10 * 60), work.0);
-
-                let intent = match work.2 {
-                    Intent::Read => mio::Interest::READABLE,
-                    Intent::Write => mio::Interest::WRITABLE,
-                };
-
-                match registry.register(&mut work.1, mio::Token(work.0), intent) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        log::error!("Failed to register socket: {}", e);
-                        continue;
+                        self.ids.remove(&id);
                     }
                 }
-
-                self.registered.insert(work.0, (work.1, work.2));
             }
 
+            // check if we have new blocks to broadcast
+            self.block_notifier.try_iter().for_each(|block| {
+                for id in self.ids.iter() {
+                    let worker_id = id % WORKES_PER_CLUSTER;
+                    let worker: &Sender<Message> = &self.worker_pool[worker_id];
+
+                    worker
+                        .send(Message::SendToPeer((
+                            *id,
+                            NetworkMessage::Inv(vec![Inventory::Block(block)]),
+                        )))
+                        .expect("Failed to send to worker");
+                }
+            });
+
+            // Figures out for how long should we wait for the next event
+            // We'll wait for the next timeout, or 10 seconds if we don't have any
             let next_timeout = self
                 .timeouts
                 .iter()
-                .next()
-                .map(|(t, _)| t.duration_since(Instant::now()));
+                .min_by_key(|(_, when)| *when)
+                .map(|(_, when)| when.saturating_duration_since(Instant::now()));
 
+            // wait
             if let Err(e) = poll.poll(
                 &mut events,
-                Some(next_timeout.unwrap_or(Duration::from_secs(1))),
+                Some(next_timeout.unwrap_or(Duration::from_secs(10))),
             ) {
                 log::error!("Failed to poll: {}", e);
                 continue;
             }
 
-            self.block_notifier.try_iter().for_each(|block| {
-                let inv = RawNetworkMessage::new(
-                    self.magic,
-                    NetworkMessage::Inv(vec![Inventory::Block(block)]),
-                );
-
-                let msg = serialize(&inv);
-
-                self.registered.iter_mut().for_each(|(_, (socket, _))| {
-                    let _ = socket.write_all(&msg);
-                });
-            });
-
-            let registry = poll.registry();
+            // handle events
             for event in events.iter() {
                 match event.token() {
                     mio::Token(0) => {
                         debug!("reactor: our listener got a new event");
 
-                        let Ok((stream, address)) = self.listener.accept() else {
+                        let Ok((mut stream, address)) = self.listener.accept() else {
                             log::error!("Failed to accept connection");
                             continue;
                         };
 
+                        let id = random();
+
+                        poll.registry()
+                            .register(
+                                &mut stream,
+                                mio::Token(id),
+                                mio::Interest::READABLE | mio::Interest::WRITABLE,
+                            )
+                            .expect("Failed to register socket");
+
+                        self.ids.insert(id);
+
                         info!("reactor: saw new connection from {address}");
 
                         self.worker_pool[0]
-                            .send(Message::NewConnection(stream))
+                            .send(Message::NewConnection((id, stream)))
                             .expect("Failed to send new connection to worker");
                     }
 
                     mio::Token(token) => {
                         debug!("reactor: event for {token}");
+                        let timeout = Duration::from_secs(60);
+                        self.timeouts
+                            .entry(token)
+                            .and_modify(|entry| *entry = Instant::now() + Duration::from_secs(60))
+                            .or_insert(Instant::now() + timeout);
 
+                        self.pings.remove(&token);
+
+                        // disconnect if the socket is closed
                         if event.is_read_closed() || event.is_write_closed() || event.is_error() {
-                            let (mut socket, _) = self
-                                .registered
-                                .remove(&token)
-                                .expect("BUG: socket is registered but not in registered map");
-
-                            if let Err(e) = registry.deregister(&mut socket) {
-                                error!("can't deregister socket {token} due to {e:?}");
-                                continue;
-                            }
-
-                            self.pings.retain(|_, id| id != &token);
-                            self.timeouts.retain(|_, id| id != &token);
                             self.worker_pool[0]
                                 .send(Message::Disconnect(token))
                                 .expect("Failed to send disconnect to worker");
                             continue;
                         }
 
-                        let worker_id = random::<usize>() % self.worker_pool.len();
-                        let worker = self.worker_pool.get(worker_id).expect("broken worker");
-                        let (mut socket, intent) = self
-                            .registered
-                            .remove(&token)
-                            .expect("BUG: socket is registered but not in registered map");
+                        let worker_id = token % WORKES_PER_CLUSTER;
+                        let worker: &Sender<Message> = &self.worker_pool[worker_id];
 
-                        if let Err(e) = registry.deregister(&mut socket) {
-                            error!("can't deregister socket {token} due to {e:?}");
-                            continue;
+                        if event.is_readable() {
+                            worker
+                                .send(Message::ReadReady(token))
+                                .expect("Failed to send to worker");
                         }
 
-                        self.pings.retain(|_, id| id != &token);
-                        self.timeouts.retain(|_, id| id != &token);
-
-                        debug!("reactor: sending job to worker {}", worker_id);
-                        match intent {
-                            Intent::Read => {
-                                worker
-                                    .send(Message::ReadReady((socket, token)))
-                                    .expect("Failed to send to worker");
-                            }
-                            Intent::Write => {
-                                worker
-                                    .send(Message::WriteReady((socket, token)))
-                                    .expect("Failed to send to worker");
-                            }
+                        if event.is_writable() {
+                            worker
+                                .send(Message::WriteReady(token))
+                                .expect("Failed to send to worker");
                         }
                     }
                 }
             }
 
-            let now = Instant::now();
-            let new_timeout = self.timeouts.split_off(&now);
+            // check if some of our peers haven't sent us a message for too long
+            let timed_out: Vec<usize> = self
+                .timeouts
+                .iter()
+                .filter_map(|(id, when)| {
+                    if Instant::now() > *when {
+                        return Some(*id);
+                    }
 
-            for (_, id) in self.timeouts {
-                debug!("reactor: sending ping to {id}");
+                    None
+                })
+                .collect();
+            // send a ping to those who didn't
+            let timeout = Instant::now() + Duration::from_secs(60);
+            for id in timed_out {
                 let nonce = random();
-                let ping = RawNetworkMessage::new(self.magic, NetworkMessage::Ping(nonce));
+                let ping = NetworkMessage::Ping(nonce);
 
-                let msg = serialize(&ping);
-                let (socket, _) = self
-                    .registered
-                    .get_mut(&id)
-                    .expect("BUG: socket is registered but not in registered map");
+                let worker_id = id % WORKES_PER_CLUSTER;
+                let worker: &mut Sender<Message> = &mut self.worker_pool[worker_id];
+                worker
+                    .send(Message::SendToPeer((id, ping)))
+                    .expect("can't write to worker");
 
-                match socket.write_all(&msg) {
-                    Ok(_) => {
-                        self.pings.insert(now + Duration::from_secs(30), id);
-                    }
-                    Err(e) => {
-                        log::error!("Failed to send ping: {}", e);
-                        self.registered.remove(&id);
-                        self.worker_pool[0]
-                            .send(Message::Disconnect(id))
-                            .expect("Failed to send disconnect to worker");
-                        continue;
-                    }
-                }
+                self.timeouts
+                    .entry(id)
+                    .and_modify(|entry| *entry = Instant::now() + Duration::from_secs(60));
+
+                self.pings.insert(id, timeout);
             }
 
-            self.timeouts = new_timeout;
-            for (time, id) in self.pings.iter() {
-                // request timed out, assume peer died
-                if *time < now {
-                    debug!("reactor: peer {id} timed out ping");
+            // check for peers that timed out on the ping
+            self.pings
+                .iter()
+                .filter_map(|(id, when)| {
+                    if Instant::now() > *when {
+                        return Some(*id);
+                    }
 
-                    self.worker_pool[0]
-                        .send(Message::Disconnect(*id))
-                        .expect("Failed to send disconnect to worker");
-                    self.registered.remove(id);
-                }
-            }
+                    None
+                })
+                .for_each(|id| {
+                    let worker_id = id % WORKES_PER_CLUSTER;
+                    let worker = &mut self.worker_pool[worker_id];
+
+                    worker
+                        .send(Message::Disconnect(id))
+                        .expect("can't write to worker");
+                });
         }
     }
 }

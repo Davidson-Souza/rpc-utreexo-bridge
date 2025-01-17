@@ -48,6 +48,7 @@ time = "0.3.36"
 ahash = "0.8.11"
 ctrlc = "3.4.5"
 mio = { version = "1.0.2", features = ["net", "os-poll"] }
+dotenv = "0.15.0"
 
 [features]
 default = ["bitcoin", "node", "api"]

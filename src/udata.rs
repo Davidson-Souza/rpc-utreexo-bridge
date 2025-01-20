@@ -12,7 +12,7 @@ use bitcoin::VarInt;
 use serde::Deserialize;
 use serde::Serialize;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LeafContext {
     #[allow(dead_code)]
     pub block_hash: BlockHash,

@@ -13,9 +13,13 @@ use actix_web::HttpServer;
 use actix_web::Responder;
 use bitcoin::consensus::deserialize;
 use bitcoin::hashes::Hash;
+use bitcoin::Amount;
 use bitcoin::Block;
 use bitcoin::BlockHash;
+use bitcoin::OutPoint;
+use bitcoin::TxOut;
 use bitcoin::Txid;
+use bitcoin_hashes::hex::ToHex;
 use bitcoincore_rpc::jsonrpc::serde_json::json;
 use futures::channel::mpsc::Sender;
 use futures::lock::Mutex;
@@ -29,6 +33,7 @@ use crate::chainview::ChainView;
 use crate::prover::Requests;
 use crate::prover::Responses;
 use crate::udata::CompactLeafData;
+use crate::udata::LeafData;
 use crate::udata::UtreexoBlock;
 
 type SenderCh = Mutex<
@@ -85,6 +90,53 @@ async fn get_tx_unspent(hash: web::Path<Txid>, data: web::Data<AppState>) -> imp
     }
 }
 
+async fn get_leaf_data(outpoint: web::Path<String>, data: web::Data<AppState>) -> impl Responder {
+    let outpoint = outpoint.into_inner();
+    let outpoint = OutPoint::from_str(&outpoint);
+
+    if let Err(e) = outpoint {
+        return HttpResponse::BadRequest().body(format!("Invalid outpoint {e}"));
+    }
+
+    let res = perform_request(&data, Requests::GetLeaf(outpoint.unwrap())).await;
+    match res {
+        Ok(Responses::LeafData(leaf_data)) => {
+            let leaf_hash = LeafData::get_leaf_hashes(&leaf_data).to_hex();
+            let leaf_data = LeafDataResponse {
+                hash: leaf_hash.clone(),
+                block_hash: leaf_data.block_hash,
+                prevout: OutPoint {
+                    txid: leaf_data.txid,
+                    vout: leaf_data.vout,
+                },
+                utxo: TxOut {
+                    value: Amount::from_sat(leaf_data.value),
+                    script_pubkey: leaf_data.pk_script,
+                },
+                block_height: leaf_data.block_height,
+                is_coinbase: leaf_data.is_coinbase,
+            };
+
+            HttpResponse::Ok().json(json!({
+                "error": null,
+                "data": json!({
+                    "hash": leaf_hash,
+                    "leaf_data": leaf_data
+                }),
+            }))
+        }
+
+        Ok(_) => HttpResponse::InternalServerError().json(json!({
+            "error": "Invalid response",
+            "data": null
+        })),
+
+        Err(e) => HttpResponse::BadRequest().json(json!({
+            "error": e,
+            "data": null,
+        })),
+    }
+}
 /// The handler for the `/proof/{hash}` endpoint. It returns a proof for the given hash, if
 /// it exists.
 async fn get_proof(hash: web::Path<String>, data: web::Data<AppState>) -> impl Responder {
@@ -258,11 +310,13 @@ pub async fn create_api(
         sender: Mutex::new(request),
         view,
     });
+
     HttpServer::new(move || {
         let cors = Cors::permissive();
         App::new()
             .wrap(cors)
             .app_data(app_state.clone())
+            .route("/leaf/{outpoint}", web::get().to(get_leaf_data))
             .route("/prove/{leaf}", web::get().to(get_proof))
             .route("/roots", web::get().to(get_roots))
             .route("/block/{height}", web::get().to(get_block_by_height))
@@ -315,6 +369,7 @@ pub enum ScriptPubkeyType {
     /// p2wsh
     WitnessV0ScriptHash,
 }
+
 impl From<UtreexoBlock> for UBlock {
     fn from(block: UtreexoBlock) -> Self {
         let proof = block.udata.as_ref().unwrap().proof.clone();
@@ -337,4 +392,14 @@ impl From<UtreexoBlock> for UBlock {
             leaf_data: leaves,
         }
     }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct LeafDataResponse {
+    hash: String,
+    block_hash: BlockHash,
+    prevout: OutPoint,
+    utxo: TxOut,
+    block_height: u32,
+    is_coinbase: bool,
 }

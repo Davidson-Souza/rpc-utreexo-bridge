@@ -64,6 +64,7 @@ pub trait LeafCache: Sync + Send + Sized + 'static {
     fn remove(&mut self, outpoint: &OutPoint) -> Option<LeafContext>;
     fn insert(&mut self, outpoint: OutPoint, leaf_data: LeafContext) -> bool;
     fn flush(&mut self) {}
+    fn get(&self, outpoint: &OutPoint) -> Option<LeafContext>;
     fn cache_size(&self) -> usize {
         0
     }
@@ -77,6 +78,10 @@ impl LeafCache for HashMap<OutPoint, LeafContext> {
     fn insert(&mut self, outpoint: OutPoint, leaf_data: LeafContext) -> bool {
         self.insert(outpoint, leaf_data);
         false
+    }
+
+    fn get(&self, outpoint: &OutPoint) -> Option<LeafContext> {
+        self.get(outpoint).cloned()
     }
 }
 
@@ -185,11 +190,21 @@ impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage>
                     .acc
                     .prove(&[node])
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
+
                 Ok(Responses::Proof(proof))
             }
             Requests::GetRoots => {
                 let roots = self.acc.get_roots().iter().map(|x| x.get_data()).collect();
                 Ok(Responses::Roots(roots))
+            }
+            Requests::GetLeaf(outpoint) => {
+                let leaf = self.leaf_data.get(&outpoint).ok_or(anyhow::anyhow!(
+                    "Leaf for outpoint {}:{} not found",
+                    outpoint.txid,
+                    outpoint.vout
+                ))?;
+
+                Ok(Responses::LeafData(leaf))
             }
             Requests::GetBlockByHeight(height) => {
                 let hash = self
@@ -350,7 +365,7 @@ impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage>
             }
 
             #[cfg(feature = "api")]
-            if let Ok(Some((req, res))) = receiver.try_next() {
+            while let Ok(Some((req, res))) = receiver.try_next() {
                 let ret = self.handle_request(req).map_err(|e| e.to_string());
                 res.send(ret)
                     .map_err(|_| anyhow::anyhow!("Error sending response"))?;
@@ -361,7 +376,7 @@ impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage>
                 continue;
             }
 
-            std::thread::sleep(std::time::Duration::from_secs(10));
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
         self.save_to_disk(None)
             .expect("could not save the acc to disk");
@@ -370,7 +385,12 @@ impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage>
     }
 
     fn check_tip(&mut self, last_tip_update: &mut std::time::Instant) -> anyhow::Result<()> {
+        if last_tip_update.elapsed() < std::time::Duration::from_secs(10) {
+            return Ok(());
+        }
+
         let height = self.rpc.get_block_count()? as u32;
+
         if height > self.height {
             self.prove_range(self.height + 1, height)?;
 
@@ -579,6 +599,7 @@ pub enum Requests {
     /// Returns multiple blocks and utreexo data for them.
     GetBlocksByHeight(u32, u32),
     GetTxUnpent(Txid),
+    GetLeaf(OutPoint),
 }
 /// All responses the prover will send.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -597,4 +618,5 @@ pub enum Responses {
     /// Multiple blocks and utreexo data for them.
     Blocks(Vec<Vec<u8>>),
     TransactionOut(Vec<TxOut>, Proof),
+    LeafData(LeafContext),
 }

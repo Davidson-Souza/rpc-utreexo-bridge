@@ -48,6 +48,7 @@ use anyhow::Result;
 use bitcoincore_rpc::Auth;
 use bitcoincore_rpc::Client;
 use chaininterface::Blockchain;
+use dotenv::dotenv;
 use jemallocator::Jemalloc;
 use log::info;
 use simplelog::Config;
@@ -66,6 +67,8 @@ pub mod bitcoin_bridge;
 use crate::bitcoin_bridge::run_bridge;
 
 fn main() -> anyhow::Result<()> {
+    dotenv().ok();
+
     run_bridge()
 }
 

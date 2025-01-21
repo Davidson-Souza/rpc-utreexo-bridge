@@ -33,6 +33,34 @@ impl LeafCache for DiskLeafStorage {
         self.cache.len() > 100_000
     }
 
+    fn get(&self, outpoint: &OutPoint) -> Option<LeafContext> {
+        self.cache
+            .get(outpoint)
+            .map(|(_, leaf_data)| leaf_data.clone())
+            .or_else(|| {
+                let leaf = self.bucket.get(&serialize(outpoint)).ok().flatten()?;
+                let block_height = deserialize(&leaf[0..4]).unwrap();
+                let txid = deserialize(&leaf[4..36]).unwrap();
+                let vout = deserialize(&leaf[36..40]).unwrap();
+                let value = deserialize(&leaf[40..48]).unwrap();
+                let block_hash = deserialize(&leaf[48..80]).unwrap();
+                let is_coinbase = deserialize(&leaf[80..81]).unwrap();
+                let median_time_past = deserialize(&leaf[81..85]).unwrap();
+                let pk_script = deserialize(&leaf[85..]).unwrap();
+
+                Some(LeafContext {
+                    block_height,
+                    txid,
+                    vout,
+                    value,
+                    pk_script,
+                    block_hash,
+                    is_coinbase,
+                    median_time_past,
+                })
+            })
+    }
+
     fn remove(&mut self, outpoint: &OutPoint) -> Option<LeafContext> {
         self.cache
             .remove(outpoint)

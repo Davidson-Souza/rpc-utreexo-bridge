@@ -236,10 +236,27 @@ async fn get_n_blocks(height: web::Path<(u32, u32)>, data: web::Data<AppState>) 
 async fn get_roots_with_leaf(data: web::Data<AppState>) -> Result<HttpResponse, actix_web::Error> {
     let res = perform_request(&data, Requests::GetCSN).await;
     match res {
-        Ok(Responses::CSN(acc)) => Ok(HttpResponse::Ok().json(json!({
-            "error": null,
-            "data": acc
-        }))),
+        Ok(Responses::CSN(acc)) => {
+            #[derive(Serialize)]
+            struct Acc {
+                pub roots: Vec<String>,
+                pub leaves: u64,
+            }
+
+            let stump = Acc {
+                leaves: acc.leaves,
+                roots: acc
+                    .roots
+                    .iter()
+                    .map(|x| x.to_string())
+                    .collect::<Vec<String>>(),
+            };
+
+            Ok(HttpResponse::Ok().json(json!({
+                "error": null,
+                "data": stump
+            })))
+        }
         Ok(_) => Ok(HttpResponse::InternalServerError().json(json!({
             "error": "Invalid response",
             "data": null

@@ -418,7 +418,7 @@ pub mod shinigami_udata {
         is_coinbase: bool,
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     /// We need a stateful wrapper around the actual hash, this is because we use those different
     /// values inside our accumulator. Here we use an enum to represent the different states, you
     /// may want to use a struct with more data, depending on your needs.
@@ -437,6 +437,7 @@ pub mod shinigami_udata {
         ///
         /// Same as the placeholder, you can implement this the way you want, just make sure that
         /// [BitcoinNodeHash::is_empty] and [NodeHash::empty] returns sane values.
+        #[default]
         Empty,
     }
 

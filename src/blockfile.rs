@@ -22,6 +22,7 @@ use bitcoin::Script;
 use bitcoin::VarInt;
 use mmap::MapOption;
 use mmap::MemoryMap;
+use rustreexo::accumulator::mem_forest::MemForest;
 
 use crate::block_index::BlockIndex;
 use crate::prover::BlockStorage;
@@ -131,7 +132,7 @@ impl BlockStorage for BlockFile {
         _block_height: u32,
         proof: rustreexo::accumulator::proof::Proof<crate::prover::AccumulatorHash>,
         leaves: Vec<crate::udata::LeafContext>,
-        _acc: &rustreexo::accumulator::pollard::Pollard<crate::prover::AccumulatorHash>,
+        _acc: &MemForest<crate::prover::AccumulatorHash>,
     ) -> BlockIndex {
         let batch_proof = BatchProof {
             targets: proof.targets.iter().map(|x| VarInt(*x)).collect(),

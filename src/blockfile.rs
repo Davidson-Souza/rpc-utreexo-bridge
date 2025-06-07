@@ -53,7 +53,7 @@ impl BlockFile {
             .write(true)
             .create(true)
             .truncate(false)
-            .open(&path)?;
+            .open(path)?;
 
         let pos = file.seek(std::io::SeekFrom::End(0))?;
         let mmap = MemoryMap::new(
@@ -146,7 +146,7 @@ impl BlockStorage for BlockFile {
         let leaves = leaves
             .into_iter()
             .map(|leaf| {
-                let header_code = leaf.block_height << 1 | leaf.is_coinbase as u32;
+                let header_code = (leaf.block_height << 1) | leaf.is_coinbase as u32;
 
                 CompactLeafData {
                     header_code,

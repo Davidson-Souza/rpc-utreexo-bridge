@@ -307,6 +307,7 @@ impl Worker {
     ///
     /// This function doesn't spawn any thread, the caller is responsible for running [Worker::run]
     /// inside a thread
+    #[allow(clippy::too_many_arguments)]
     fn new(
         id: usize,
         peers: Rc<UnsafeCell<HashMap<usize, Peer>>>,

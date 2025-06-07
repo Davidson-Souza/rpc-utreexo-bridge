@@ -236,7 +236,7 @@ async fn get_n_blocks(height: web::Path<(u32, u32)>, data: web::Data<AppState>) 
 async fn get_roots_with_leaf(data: web::Data<AppState>) -> Result<HttpResponse, actix_web::Error> {
     let res = perform_request(&data, Requests::GetCSN).await;
     match res {
-        Ok(Responses::CSN(acc)) => {
+        Ok(Responses::Csn(acc)) => {
             #[derive(Serialize)]
             struct Acc {
                 pub roots: Vec<String>,

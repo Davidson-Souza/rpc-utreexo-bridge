@@ -375,7 +375,7 @@ pub mod bitcoin_leaf_data {
                     txid: value.txid,
                     vout: value.vout,
                 },
-                header_code: value.block_height << 1 | value.is_coinbase as u32,
+                header_code: (value.block_height << 1) | value.is_coinbase as u32,
                 utxo: TxOut {
                     value: Amount::from_sat(value.value),
                     script_pubkey: value.pk_script,

@@ -56,6 +56,7 @@ pub trait BlockStorage {
         leaves: Vec<LeafContext>,
         acc: &MemForest<AccumulatorHash>,
     ) -> BlockIndex;
+    #[cfg_attr(feature = "shinigami", allow(unused))]
     fn get_block(&self, index: BlockIndex) -> Option<UtreexoBlock>;
 }
 
@@ -66,6 +67,7 @@ pub trait LeafCache: Sync + Send + Sized + 'static {
     fn remove(&mut self, outpoint: &OutPoint) -> Option<LeafContext>;
     fn insert(&mut self, outpoint: OutPoint, leaf_data: LeafContext) -> bool;
     fn flush(&mut self) {}
+    #[cfg_attr(feature = "shinigami", allow(unused))]
     fn get(&self, outpoint: &OutPoint) -> Option<LeafContext>;
     fn cache_size(&self) -> usize {
         0
@@ -122,6 +124,7 @@ pub struct Prover<LeafStorage: LeafCache, Storage: BlockStorage> {
 
 impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage> {
     /// Creates a new prover. It loads the accumulator from disk, if it exists.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         rpc: Box<dyn Blockchain>,
         index_database: Arc<BlocksIndex>,
@@ -299,7 +302,7 @@ impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage>
             Requests::GetCSN => {
                 let roots = self.acc.get_roots().iter().map(|x| x.get_data()).collect();
                 let leaves = self.acc.leaves;
-                Ok(Responses::CSN(Stump { roots, leaves }))
+                Ok(Responses::Csn(Stump { roots, leaves }))
             }
             Requests::GetBlocksByHeight(height, count) => {
                 let mut blocks = Vec::new();
@@ -616,7 +619,7 @@ pub enum Responses {
     Transaction((Transaction, Proof)),
     /// The CSN of the current acc
     #[allow(clippy::upper_case_acronyms)]
-    CSN(Stump),
+    Csn(Stump),
     /// Multiple blocks and utreexo data for them.
     Blocks(Vec<Vec<u8>>),
     TransactionOut(Vec<TxOut>, Proof),

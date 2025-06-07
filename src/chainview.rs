@@ -23,6 +23,7 @@ impl ChainView {
             .set(&hash.to_byte_array().as_slice(), &roots);
     }
 
+    #[cfg(feature = "api")]
     pub fn get_acc(&self, hash: BlockHash) -> Result<Option<Vec<u8>>, kv::Error> {
         let bucket = self
             .storage
@@ -46,6 +47,7 @@ impl ChainView {
             .flush();
     }
 
+    #[cfg(feature = "api")]
     pub fn get_block(&self, hash: BlockHash) -> Result<Option<Vec<u8>>, kv::Error> {
         let bucket = self
             .storage
@@ -54,6 +56,7 @@ impl ChainView {
         bucket.get(&hash.to_byte_array().as_slice())
     }
 
+    #[cfg(feature = "api")]
     pub fn get_block_hash(&self, height: u32) -> Result<Option<BlockHash>, kv::Error> {
         let bucket = self
             .storage
@@ -87,6 +90,7 @@ impl ChainView {
         Ok(())
     }
 
+    #[cfg(feature = "api")]
     pub fn get_height(&self, hash: BlockHash) -> Result<Option<u32>, kv::Error> {
         let bucket = self
             .storage

@@ -56,8 +56,8 @@ pub fn run_bridge() -> anyhow::Result<()> {
     let view = chainview::ChainView::new(store);
     let view = Arc::new(view);
 
-    let net: bitcoin::Network = cli_options.network.into();
-    let genesis = genesis_block(net);
+    let network = cli_options.network;
+    let genesis = genesis_block(network);
 
     if view.get_height(genesis.block_hash()).is_err() {
         view.save_header(genesis.block_hash(), serialize(&genesis.header))

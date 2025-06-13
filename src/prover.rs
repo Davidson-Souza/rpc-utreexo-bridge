@@ -6,6 +6,8 @@
 //! uses a channel to receive requests and sends responses through a oneshot channel, provided
 //! by the request sender. Maybe there is a better way to do this, but this is a TODO for later.
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -27,8 +29,8 @@ use bitcoin::Txid;
 use futures::channel::mpsc::Receiver;
 use log::error;
 use log::info;
+use rustreexo::accumulator::mem_forest::MemForest;
 use rustreexo::accumulator::node_hash::BitcoinNodeHash;
-use rustreexo::accumulator::pollard::Pollard;
 use rustreexo::accumulator::proof::Proof;
 use rustreexo::accumulator::stump::Stump;
 use serde::Deserialize;
@@ -52,8 +54,9 @@ pub trait BlockStorage {
         block_height: u32,
         proof: Proof<AccumulatorHash>,
         leaves: Vec<LeafContext>,
-        acc: &Pollard<AccumulatorHash>,
+        acc: &MemForest<AccumulatorHash>,
     ) -> BlockIndex;
+    #[cfg_attr(feature = "shinigami", allow(unused))]
     fn get_block(&self, index: BlockIndex) -> Option<UtreexoBlock>;
 }
 
@@ -64,6 +67,7 @@ pub trait LeafCache: Sync + Send + Sized + 'static {
     fn remove(&mut self, outpoint: &OutPoint) -> Option<LeafContext>;
     fn insert(&mut self, outpoint: OutPoint, leaf_data: LeafContext) -> bool;
     fn flush(&mut self) {}
+    #[cfg_attr(feature = "shinigami", allow(unused))]
     fn get(&self, outpoint: &OutPoint) -> Option<LeafContext>;
     fn cache_size(&self) -> usize {
         0
@@ -92,7 +96,7 @@ pub struct Prover<LeafStorage: LeafCache, Storage: BlockStorage> {
     /// A reference to the RPC client that is used to query the blockchain.
     rpc: Box<dyn Blockchain>,
     /// The accumulator that holds the state of the utreexo accumulator.
-    acc: Pollard<AccumulatorHash>,
+    acc: MemForest<AccumulatorHash>,
     /// An index that keeps track of the blocks that are stored on disk, we need this
     /// to get the blocks from disk.
     storage: Arc<BlocksIndex>,
@@ -120,6 +124,7 @@ pub struct Prover<LeafStorage: LeafCache, Storage: BlockStorage> {
 
 impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage> {
     /// Creates a new prover. It loads the accumulator from disk, if it exists.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         rpc: Box<dyn Blockchain>,
         index_database: Arc<BlocksIndex>,
@@ -154,24 +159,24 @@ impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage>
     }
 
     /// Tries to load the accumulator from disk. If it fails, it creates a new one.
-    fn try_from_disk(path: Option<PathBuf>) -> Pollard<AccumulatorHash> {
+    fn try_from_disk(path: Option<PathBuf>) -> MemForest<AccumulatorHash> {
         if let Some(path) = path {
-            let file = std::fs::File::open(&path).unwrap();
-            let reader = std::io::BufReader::new(file);
-            match Pollard::<AccumulatorHash>::deserialize(reader) {
+            let file = File::open(&path).unwrap();
+            let reader = BufReader::new(file);
+            match MemForest::<AccumulatorHash>::deserialize(reader) {
                 Ok(acc) => return acc,
                 Err(e) => panic!("Failed to load accumulator at {path:?}, reson: {e:?}"),
             }
         }
 
         let Ok(file) = std::fs::File::open(crate::subdir("/pollard")) else {
-            return Pollard::new_with_hash();
+            return MemForest::<AccumulatorHash>::new_with_hash();
         };
 
-        let reader = std::io::BufReader::new(file);
-        match Pollard::<AccumulatorHash>::deserialize(reader) {
+        let reader = BufReader::new(file);
+        match MemForest::<AccumulatorHash>::deserialize(reader) {
             Ok(acc) => acc,
-            Err(_) => Pollard::new_with_hash(),
+            Err(_) => MemForest::<AccumulatorHash>::new_with_hash(),
         }
     }
 
@@ -297,7 +302,7 @@ impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage>
             Requests::GetCSN => {
                 let roots = self.acc.get_roots().iter().map(|x| x.get_data()).collect();
                 let leaves = self.acc.leaves;
-                Ok(Responses::CSN(Stump { roots, leaves }))
+                Ok(Responses::Csn(Stump { roots, leaves }))
             }
             Requests::GetBlocksByHeight(height, count) => {
                 let mut blocks = Vec::new();
@@ -614,7 +619,7 @@ pub enum Responses {
     Transaction((Transaction, Proof)),
     /// The CSN of the current acc
     #[allow(clippy::upper_case_acronyms)]
-    CSN(Stump),
+    Csn(Stump),
     /// Multiple blocks and utreexo data for them.
     Blocks(Vec<Vec<u8>>),
     TransactionOut(Vec<TxOut>, Proof),

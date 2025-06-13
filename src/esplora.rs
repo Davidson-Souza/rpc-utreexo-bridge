@@ -35,25 +35,25 @@ impl EsploraBlockchain {
 impl Blockchain for EsploraBlockchain {
     fn get_block_hash(&self, height: u64) -> Result<bitcoin::BlockHash> {
         let url = format!("{}/block-height/{}", self.url, height);
-        let block = self.client.get(&url).send()?.text()?;
+        let block = self.client.get(url).send()?.text()?;
         Ok(block.parse().unwrap_or(BlockHash::all_zeros()))
     }
 
     fn get_block(&self, block_hash: BlockHash) -> Result<Block> {
         let url = format!("{}/block/{}/raw", self.url, block_hash);
-        let block = self.client.get(&url).send()?.bytes()?;
+        let block = self.client.get(url).send()?.bytes()?;
         Ok(consensus::deserialize::<Block>(&block)?)
     }
 
     fn get_transaction(&self, txid: bitcoin::Txid) -> Result<bitcoin::Transaction> {
         let url = format!("{}/tx/{}/raw", self.url, txid);
-        let tx = self.client.get(&url).send()?.bytes()?;
+        let tx = self.client.get(url).send()?.bytes()?;
         Ok(consensus::deserialize::<bitcoin::Transaction>(&tx)?)
     }
 
     fn get_block_height(&self, block_hash: BlockHash) -> Result<u32> {
         let url = format!("{}/block/{}", self.url, block_hash);
-        let block = self.client.get(&url).send()?.text()?;
+        let block = self.client.get(url).send()?.text()?;
         let block: serde_json::Value = serde_json::from_str(&block)?;
         let Some(height) = block["height"].as_u64() else {
             return Err(anyhow::anyhow!("No header found"));
@@ -63,7 +63,7 @@ impl Blockchain for EsploraBlockchain {
 
     fn get_block_header(&self, block_hash: BlockHash) -> Result<Header> {
         let url = format!("{}/block/{}/header", self.url, block_hash);
-        let header = self.client.get(&url).send()?.text()?;
+        let header = self.client.get(url).send()?.text()?;
         let header: serde_json::Value = serde_json::from_str(&header)?;
         let Some(header) = header["hex"].as_str() else {
             return Err(anyhow::anyhow!("No header found"));
@@ -74,25 +74,25 @@ impl Blockchain for EsploraBlockchain {
 
     fn get_block_count(&self) -> Result<u64> {
         let url = format!("{}/blocks/tip/height", self.url);
-        let height = self.client.get(&url).send()?.text()?;
+        let height = self.client.get(url).send()?.text()?;
         Ok(height.parse()?)
     }
 
     fn get_raw_transaction_info(&self, txid: &bitcoin::Txid) -> Result<TransactionInfo> {
         let client = Client::new();
         let url = format!("{}/tx/{}/status", self.url, txid);
-        let tx = client.get(&url).send()?.text()?;
+        let tx = client.get(url).send()?.text()?;
         let tx: serde_json::Value = serde_json::from_str(&tx)?;
 
         let tx_hex = client
-            .get(&format!("{}/tx/{}/hex", self.url, txid))
+            .get(format!("{}/tx/{}/hex", self.url, txid))
             .send()?
             .text()?;
         Ok(TransactionInfo {
             is_coinbase: tx["vin"][0]["coinbase"].as_str().is_some(),
             blockhash: tx["block_hash"]
                 .as_str()
-                .and_then(|hash| Some(hash.parse()))
+                .map(|hash| hash.parse())
                 .transpose()?,
             height: tx["block_height"].as_u64().unwrap_or(0) as u32,
             tx: consensus::deserialize(&hex::decode(tx_hex)?)?,

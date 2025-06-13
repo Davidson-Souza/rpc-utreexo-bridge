@@ -3,7 +3,7 @@ use std::fs::File;
 use std::path::PathBuf;
 
 use bitcoin::Block;
-use rustreexo::accumulator::pollard::Pollard;
+use rustreexo::accumulator::mem_forest::MemForest;
 use rustreexo::accumulator::proof::Proof;
 use serde::Serialize;
 
@@ -45,7 +45,7 @@ impl BlockStorage for JsonBlockFiles {
         block_height: u32,
         proof: Proof<AccumulatorHash>,
         _leaves: Vec<LeafContext>,
-        acc: &Pollard<AccumulatorHash>,
+        acc: &MemForest<AccumulatorHash>,
     ) -> BlockIndex {
         let block_data = BlockData {
             block_height,

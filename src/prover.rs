@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 
+use anyhow::Context;
 use bitcoin::consensus::serialize;
 use bitcoin::consensus::Encodable;
 use bitcoin::Block;
@@ -239,58 +240,52 @@ impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage>
                     .get_transaction(txid)
                     .map_err(|_| anyhow::anyhow!("Transaction {} not found", txid))?;
 
-                let (outputs, hashes): (Vec<TxOut>, Vec<AccumulatorHash>) = tx
-                    .output
-                    .iter()
-                    .enumerate()
-                    .flat_map(|(idx, output)| {
-                        let (hash, _) = self.get_input_leaf_hash(&TxIn {
-                            previous_output: OutPoint {
-                                txid,
-                                vout: idx as u32,
-                            },
-                            script_sig: ScriptBuf::new(),
-                            sequence: Sequence::ZERO,
-                            witness: Witness::new(),
-                        });
-                        self.acc.prove(&[hash]).ok()?;
-                        Some((output.clone(), hash))
-                    })
-                    .unzip();
+                let mut hashes = Vec::new();
+                for vout in 0..tx.output.len() {
+                    let (hash, _) = self.get_input_leaf_hash(&TxIn {
+                        previous_output: OutPoint {
+                            txid,
+                            vout: vout as u32,
+                        },
+                        script_sig: ScriptBuf::new(),
+                        sequence: Sequence::ZERO,
+                        witness: Witness::new(),
+                    })?;
+
+                    // if this returns err, this output is spent
+                    if self.acc.prove(&[hash]).is_ok() {
+                        hashes.push(hash);
+                    }
+                }
 
                 let proof = self
                     .acc
                     .prove(&hashes)
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-                Ok(Responses::TransactionOut(outputs, proof))
+                Ok(Responses::TransactionOut(tx.output, proof))
             }
             Requests::GetTransaction(txid) => {
+                // returns the unspent outputs of a transaction and a proof for them
                 let tx = self
                     .rpc
                     .get_transaction(txid)
                     .map_err(|_| anyhow::anyhow!("Transaction {} not found", txid))?;
-                // TODO: this is a bit of a hack, but it works for now.
-                // Rustreexo should have a way to check whether an element is in the
-                // pollard. We have this information in the map anyway.
-                let (_outputs, hashes): (Vec<TxOut>, Vec<AccumulatorHash>) = tx
-                    .output
-                    .iter()
-                    .enumerate()
-                    .flat_map(|(idx, output)| {
-                        let (hash, _) = self.get_input_leaf_hash(&TxIn {
-                            previous_output: OutPoint {
-                                txid,
-                                vout: idx as u32,
-                            },
-                            script_sig: ScriptBuf::new(),
-                            sequence: Sequence::ZERO,
-                            witness: Witness::new(),
-                        });
-                        self.acc.prove(&[hash]).ok()?;
-                        Some((output.clone(), hash))
-                    })
-                    .unzip();
+
+                let mut hashes = Vec::new();
+                for vout in 0..tx.output.len() {
+                    let (hash, _) = self.get_input_leaf_hash(&TxIn {
+                        previous_output: OutPoint {
+                            txid,
+                            vout: vout as u32,
+                        },
+                        script_sig: ScriptBuf::new(),
+                        sequence: Sequence::ZERO,
+                        witness: Witness::new(),
+                    })?;
+
+                    hashes.push(hash);
+                }
 
                 let proof = self
                     .acc
@@ -433,7 +428,13 @@ impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage>
             );
 
             let mtp = self.rpc.get_mtp(block.header.prev_blockhash)?;
-            let (proof, leaves) = self.process_block(&block, height, mtp);
+            let (proof, leaves) = match self.process_block(&block, height, mtp) {
+                Ok((proof, leaves)) => (proof, leaves),
+                Err(e) => {
+                    error!("Couldn't process block {block_hash} due to {e:?}");
+                    return Ok(());
+                }
+            };
 
             if height > self.save_proofs_for_blocks_older_than {
                 let index = self
@@ -464,22 +465,31 @@ impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage>
     /// Pulls the [LeafData] from the bitcoin core rpc. We use this as fallback if we can't find
     /// the leaf in leaf_data. This method is slow and should only be used if we can't find the
     /// leaf in the leaf_data.
-    fn get_input_leaf_hash_from_rpc(rpc: &dyn Blockchain, input: &TxIn) -> Option<LeafContext> {
-        let tx_info = rpc
-            .get_raw_transaction_info(&input.previous_output.txid)
-            .ok()?;
+    fn get_input_leaf_hash_from_rpc(
+        rpc: &Box<dyn Blockchain>,
+        input: &TxIn,
+    ) -> anyhow::Result<LeafContext> {
+        let tx_info = rpc.get_raw_transaction_info(&input.previous_output.txid)?;
+
+        let Some(block_hash) = tx_info.blockhash else {
+            return Err(anyhow::anyhow!(
+                "Transaction wasn't confirmed yet, so there's no leaf hash"
+            ));
+        };
 
         let height = tx_info.height;
         let output = &tx_info.tx.output[input.previous_output.vout as usize];
         let prev_block = rpc
-            .get_block_header(tx_info.blockhash?)
-            .ok()?
+            .get_block_header(block_hash)
+            .context("Failed to get block header")?
             .prev_blockhash;
 
-        let median_time_past = rpc.get_mtp(prev_block).ok()?;
+        let median_time_past = rpc
+            .get_mtp(prev_block)
+            .context("Failed to get median time past")?;
 
-        Some(LeafContext {
-            block_hash: tx_info.blockhash?,
+        Ok(LeafContext {
+            block_hash,
             median_time_past,
             block_height: height,
             is_coinbase: tx_info.is_coinbase,
@@ -492,13 +502,19 @@ impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage>
 
     /// Returns the leaf hash and the compact leaf data for a given input. If the leaf is not in
     /// leaf_data we will try to get it from the bitcoin core rpc.
-    fn get_input_leaf_hash(&mut self, input: &TxIn) -> (AccumulatorHash, LeafContext) {
-        let leaf = self
-            .leaf_data
-            .remove(&input.previous_output)
-            .unwrap_or_else(|| Self::get_input_leaf_hash_from_rpc(&*self.rpc, input).unwrap());
+    fn get_input_leaf_hash(
+        &mut self,
+        input: &TxIn,
+    ) -> anyhow::Result<(AccumulatorHash, LeafContext)> {
+        let leaf = self.leaf_data.remove(&input.previous_output);
 
-        (LeafData::get_leaf_hashes(&leaf), leaf)
+        let leaf = match leaf {
+            Some(leaf) => leaf,
+            None => Self::get_input_leaf_hash_from_rpc(&self.rpc, input)
+                .context("[get_input_leaf_hash] Failure to get leaf hash")?,
+        };
+
+        Ok((LeafData::get_leaf_hashes(&leaf), leaf))
     }
 
     fn is_unspendable(script: &Script) -> bool {
@@ -519,7 +535,7 @@ impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage>
         block: &Block,
         height: u32,
         mtp: u32,
-    ) -> (Proof<AccumulatorHash>, Vec<LeafContext>) {
+    ) -> anyhow::Result<(Proof<AccumulatorHash>, Vec<LeafContext>)> {
         let mut inputs = Vec::new();
         let mut utxos = Vec::new();
         let mut compact_leaves = Vec::new();
@@ -528,7 +544,7 @@ impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage>
             let txid = tx.compute_txid();
             for input in tx.input.iter() {
                 if !tx.is_coinbase() {
-                    let (hash, compact_leaf) = self.get_input_leaf_hash(input);
+                    let (hash, compact_leaf) = self.get_input_leaf_hash(input)?;
                     if let Some(idx) = utxos.iter().position(|h| *h == hash) {
                         utxos.remove(idx);
                     } else {
@@ -583,7 +599,7 @@ impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage>
 
         self.view.save_acc(ser_acc, block.block_hash());
 
-        (proof, compact_leaves)
+        Ok((proof, compact_leaves))
     }
 }
 
